@@ -170,7 +170,7 @@ def _dist_gather(torch_dist, obj: Any, dst: int = 0):
     return None
 
 
-_TRANSFORMERS_SUPPORTED_PATTERN = re.compile(r"qwen3(?!\.5)[\w-]*|llama.*3\.1.*8b.*instruct", re.IGNORECASE)
+_TRANSFORMERS_SUPPORTED_PATTERN = re.compile(r"qwen3[\w.-]*|llama.*3\.1.*8b.*instruct", re.IGNORECASE)
 
 
 def _check_transformers_model(model_name: str) -> None:

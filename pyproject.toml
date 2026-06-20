@@ -19,7 +19,7 @@ include = ["dflash*"]
 [project.optional-dependencies]
 transformers = [
     "torch",
-    "transformers==4.57.1",
+    "transformers==5.9.0",
     "accelerate",
     "typing-extensions",
 ]

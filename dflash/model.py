@@ -59,6 +59,37 @@ def _cuda_time() -> float:
     return time.perf_counter()
 
 
+def _snapshot_recurrent_layers(cache: Cache) -> list[tuple]:
+    """Clone the recurrent state of hybrid (linear-attention) cache layers.
+
+    Qwen3.5 interleaves linear-attention (recurrent) layers with full-attention
+    layers. Linear layers store a rolling conv/recurrent state instead of a
+    per-token KV cache, so `Cache.crop` is a no-op on them. To roll back rejected
+    draft tokens losslessly we snapshot these states before verification and
+    restore them afterwards.
+    """
+    snapshots = []
+    for layer in cache.layers:
+        conv_states = getattr(layer, "conv_states", None)
+        recurrent_states = getattr(layer, "recurrent_states", None)
+        if conv_states is None and recurrent_states is None:
+            continue
+        snapshots.append((
+            layer,
+            conv_states.clone() if conv_states is not None else None,
+            recurrent_states.clone() if recurrent_states is not None else None,
+        ))
+    return snapshots
+
+
+def _restore_recurrent_layers(snapshots: list[tuple]) -> None:
+    for layer, conv_states, recurrent_states in snapshots:
+        if conv_states is not None:
+            layer.conv_states.copy_(conv_states)
+        if recurrent_states is not None:
+            layer.recurrent_states.copy_(recurrent_states)
+
+
 @torch.inference_mode()
 def dflash_generate(
     model: "DFlashDraftModel",
@@ -80,7 +111,7 @@ def dflash_generate(
         (1, max_length + block_size), mask_token_id, dtype=torch.long, device=target.device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-    past_key_values_target = DynamicCache()
+    past_key_values_target = DynamicCache(config=target.config)
     past_key_values_draft = DynamicCache()
 
     prefill_start = _cuda_time() if return_stats else None
@@ -123,6 +154,7 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = _cuda_time()
 
+        recurrent_snapshot = _snapshot_recurrent_layers(past_key_values_target)
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
@@ -135,9 +167,27 @@ def dflash_generate(
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
-        start += acceptance_length + 1
-        past_key_values_target.crop(start)
-        acceptance_lengths.append(acceptance_length + 1)
+        block_start = start
+        num_accepted = acceptance_length + 1
+        start += num_accepted
+        acceptance_lengths.append(num_accepted)
+
+        # Roll back the rejected draft tokens. `crop` handles full-attention
+        # layers, but hybrid (Qwen3.5) linear-attention layers keep a recurrent
+        # state that `crop` cannot rewind. When such layers are present and a
+        # rejection happened, restore their pre-block state and re-commit only
+        # the accepted prefix so the recurrent state stays exactly in sync.
+        if recurrent_snapshot and num_accepted < block_size:
+            _restore_recurrent_layers(recurrent_snapshot)
+            past_key_values_target.crop(block_start)
+            target(
+                block_output_ids[:, :num_accepted],
+                position_ids=block_position_ids[:, :num_accepted],
+                past_key_values=past_key_values_target,
+                use_cache=True,
+            )
+        else:
+            past_key_values_target.crop(start)
 
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
@@ -316,7 +366,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.block_size = config.block_size
+        self.block_size = self.config.dflash_config.get("block_size", getattr(config, "block_size", None))
         self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
         self.post_init()
 
